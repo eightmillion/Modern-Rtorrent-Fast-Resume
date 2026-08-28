@@ -1,5 +1,7 @@
-# rtorrent_fast_resume_split.pl
-
+# Modern Rtorrent Fast Resume Script
+---
+This is a modern version of the old fast resume script that supports the split session files that rtorrent changed to after 0.9.7
+---
 ## Usage
 
     rtorrent_fast_resume_split.pl --session DIR [options]
