@@ -24,6 +24,8 @@ use POSIX qw(strftime);
 
 $| = 1;
 
+my $program = basename($0);
+
 my $mapping;
 my $data_dir;
 my $session;
@@ -39,6 +41,14 @@ my $quiet          = 0;
 my $verbose        = 0;
 my $help           = 0;
 my $path_mode      = 'auto';
+my $progress_opt;              # undef = automatic (TTY only)
+
+my @failure_records;
+my $progress_active    = 0;
+my $progress_total     = 0;
+my $progress_done      = 0;
+my $progress_interval  = 1;
+my $progress_line_len  = 0;
 
 GetOptions(
     'mapping|m=s'     => \$mapping,
@@ -55,6 +65,7 @@ GetOptions(
     'strict'          => \$strict,
     'quiet|q'         => \$quiet,
     'verbose|v+'      => \$verbose,
+    'progress!'       => \$progress_opt,
     'help|h'          => \$help,
 ) or usage(2);
 
@@ -153,6 +164,8 @@ my $failed        = 0;
 my $skipped       = 0;
 
 if ($have_mapping) {
+    progress_init(count_mapping_items($mapping));
+
     open my $mapfh, '<', $mapping
         or die "ERROR: cannot read '$mapping': $!\n";
 
@@ -181,6 +194,7 @@ if ($have_mapping) {
                     "line $mapping_lines",
                     "explicit mapping mode must be directory or directory_base"
                 );
+                progress_step();
                 next;
             }
         }
@@ -189,6 +203,7 @@ if ($have_mapping) {
                 "line $mapping_lines",
                 "invalid mapping line (expected HASH|PATH or HASH|MODE|PATH)"
             );
+            progress_step();
             next;
         }
 
@@ -198,16 +213,19 @@ if ($have_mapping) {
 
         unless ($hash =~ /^[0-9A-F]{40}$/) {
             handle_failure("line $mapping_lines", "invalid hash '$hash'");
+            progress_step();
             next;
         }
 
         unless (length $path) {
             handle_failure($hash, "empty path");
+            progress_step();
             next;
         }
 
         if (%wanted_hash && !$wanted_hash{$hash}) {
             $skipped++;
+            progress_step();
             next;
         }
 
@@ -216,10 +234,12 @@ if ($have_mapping) {
             if ($seen{$hash} eq $identity) {
                 print "$hash SKIPPED - duplicate mapping\n" if $verbose && !$quiet;
                 $skipped++;
+                progress_step();
                 next;
             }
 
             handle_failure($hash, "duplicate hash has conflicting mappings");
+            progress_step();
             next;
         }
 
@@ -252,8 +272,13 @@ else {
     die "ERROR: no HASH.torrent files found in '$session'\n"
         unless @hashes;
 
-    for my $hash (@hashes) {
-        next if %wanted_hash && !$wanted_hash{$hash};
+    my @selected_hashes = %wanted_hash
+        ? grep { $wanted_hash{$_} } @hashes
+        : @hashes;
+
+    progress_init(scalar @selected_hashes);
+
+    for my $hash (@selected_hashes) {
 
         if ($have_data_dir) {
             $seen{$hash} = "$path_mode\0$data_dir";
@@ -306,9 +331,12 @@ else {
             my $error = $@ || 'unknown error';
             $error =~ s/\s+$//;
             handle_failure($hash, $error);
+            progress_step();
         }
     }
 }
+
+progress_finish();
 
 if (%wanted_hash) {
     for my $hash (sort keys %wanted_hash) {
@@ -328,6 +356,14 @@ print "Finished: $updated " . ($dry_run ? "validated" : "updated") .
 print "Backups: $backup_run_dir\n"
     if !$quiet && !$dry_run && defined $backup_run_dir;
 
+if (@failure_records) {
+    print STDERR "\nFailures:\n";
+    for my $failure (@failure_records) {
+        my ($label, $message) = @$failure;
+        print STDERR "  $label - $message\n";
+    }
+}
+
 exit($failed ? 1 : 0);
 
 
@@ -343,10 +379,12 @@ sub run_one {
         my $error = $@ || 'unknown error';
         $error =~ s/\s+$//;
         handle_failure($hash, $error);
+        progress_step();
         return;
     }
 
     $updated++;
+    progress_step();
 }
 
 
@@ -553,17 +591,24 @@ sub process_torrent {
     }
 
     if ($dry_run) {
-        print "$hash OK - $chunks pieces (dry-run)\n" unless $quiet;
+        print "$hash OK - $chunks pieces (dry-run)\n"
+            unless $quiet || $progress_active;
         return;
     }
 
-    backup_file($resume_file) if $backup && -e $resume_file;
-    backup_file($rt_file)     if $backup && -e $rt_file;
+    if ($backup) {
+        # Keep a self-contained backup set for each torrent, even though the
+        # .torrent metainfo itself is not modified by this script.
+        backup_file($torrent_file) if -e $torrent_file;
+        backup_file($resume_file)  if -e $resume_file;
+        backup_file($rt_file)      if -e $rt_file;
+    }
 
     atomic_write($resume_file, bencode($resume));
     atomic_write($rt_file,     bencode($rt));
 
-    print "$hash OK - $chunks pieces\n" unless $quiet;
+    print "$hash OK - $chunks pieces\n"
+        unless $quiet || $progress_active;
 }
 
 
@@ -779,10 +824,127 @@ sub backup_file {
 }
 
 
+sub count_mapping_items {
+    my ($file) = @_;
+
+    open my $fh, '<', $file
+        or die "ERROR: cannot read '$file': $!\n";
+
+    my $count = 0;
+
+    while (my $line = <$fh>) {
+        $line =~ s/\r?\n$//;
+        next if $line =~ /^\s*$/;
+        next if $line =~ /^\s*#/;
+        $count++;
+    }
+
+    close $fh
+        or die "ERROR: cannot close '$file' after counting: $!\n";
+
+    return $count;
+}
+
+
+sub progress_init {
+    my ($total) = @_;
+
+    $progress_total    = $total || 0;
+    $progress_done     = 0;
+    $progress_line_len = 0;
+
+    my $want_progress = defined($progress_opt)
+        ? $progress_opt
+        : (-t STDOUT ? 1 : 0);
+
+    $progress_active = $want_progress && !$quiet && !$verbose && $progress_total > 0;
+
+    # Cap redraws at roughly 500 per run. A 16,000-torrent session therefore
+    # redraws about every 32 torrents instead of writing 16,000 terminal lines.
+    $progress_interval = int($progress_total / 500);
+    $progress_interval = 1 if $progress_interval < 1;
+
+    progress_draw() if $progress_active;
+}
+
+
+sub progress_step {
+    return unless $progress_active;
+
+    $progress_done++;
+    $progress_done = $progress_total if $progress_done > $progress_total;
+
+    if (
+        $progress_done == $progress_total
+        || ($progress_done % $progress_interval) == 0
+    ) {
+        progress_draw();
+    }
+}
+
+
+sub progress_draw {
+    return unless $progress_active;
+
+    my $width = 36;
+    my $ratio = $progress_total ? ($progress_done / $progress_total) : 1;
+    $ratio = 0 if $ratio < 0;
+    $ratio = 1 if $ratio > 1;
+
+    my $filled = int($ratio * $width);
+    $filled = $width if $progress_done >= $progress_total;
+
+    my $bar = ('#' x $filled) . ('-' x ($width - $filled));
+    my $pct = $ratio * 100;
+
+    my $line = sprintf(
+        "[%s] %6.2f%%  %d/%d  ok:%d  failed:%d  skipped:%d",
+        $bar,
+        $pct,
+        $progress_done,
+        $progress_total,
+        $updated,
+        $failed,
+        $skipped,
+    );
+
+    my $padding = $progress_line_len > length($line)
+        ? ' ' x ($progress_line_len - length($line))
+        : '';
+
+    print STDOUT "\r$line$padding";
+    $progress_line_len = length($line);
+}
+
+
+sub progress_clear {
+    return unless $progress_active && $progress_line_len;
+
+    print STDOUT "\r", (' ' x $progress_line_len), "\r";
+}
+
+
+sub progress_finish {
+    return unless $progress_active;
+
+    $progress_done = $progress_total;
+    progress_draw();
+    print STDOUT "\n";
+
+    $progress_active   = 0;
+    $progress_line_len = 0;
+}
+
+
 sub handle_failure {
     my ($label, $message) = @_;
 
     $message =~ s/\s+$//;
+    $message =~ s/\s+at\s+\Q$0\E\s+line\s+\d+\.?\s*$//;
+
+    progress_clear();
+
+    push @failure_records, [$label, $message];
 
     print STDERR "$label FAILED: $message\n";
     $failed++;
@@ -802,11 +964,11 @@ sub usage {
 
 
 sub usage_text {
-    return <<'USAGE';
+    my $text = <<'USAGE';
 Usage:
-  rtorrent_fast_resume_split.pl --session DIR [options]
-  rtorrent_fast_resume_split.pl --session DIR --data-dir DIR [options]
-  rtorrent_fast_resume_split.pl --session DIR [options] MAPPING_FILE
+  __PROGRAM__ --session DIR [options]
+  __PROGRAM__ --session DIR --data-dir DIR [options]
+  __PROGRAM__ --session DIR [options] MAPPING_FILE
 
 Required:
   -s, --session DIR        rTorrent split-session directory.
@@ -852,7 +1014,8 @@ Behavior:
                            resolved payload path. Otherwise preserve it.
       --start              Mark torrents started (state=1). Otherwise preserve
                            existing started/stopped state.
-      --[no-]backup        Enable or disable sidecar backups.
+      --[no-]backup        Enable or disable per-torrent backups.
+                           Backs up HASH.torrent plus both split sidecars.
                            Backups are enabled by default.
       --backup-dir DIR     Backup root directory. Default:
                            SESSION.fastresume-backups
@@ -862,6 +1025,10 @@ Behavior:
 Output:
   -q, --quiet              Print only failures and final totals.
   -v, --verbose            Show torrent and per-file calculations.
+      --[no-]progress      Enable or disable the in-place progress bar.
+                           Default: enabled automatically on a terminal,
+                           disabled when output is redirected or verbose.
+                           Failures are always listed again at the end.
   -h, --help               Show this help.
 
 Session files:
@@ -871,21 +1038,21 @@ Session files:
 
 Examples:
   # Normal case: use the paths already saved in the session.
-  rtorrent_fast_resume_split.pl \
+  __PROGRAM__ \
       --session /home/user/.session
 
   # Validate session-derived paths without changing anything.
-  rtorrent_fast_resume_split.pl \
+  __PROGRAM__ \
       --session /home/user/.session \
       --dry-run
 
   # All torrents have been moved beneath one common directory.
-  rtorrent_fast_resume_split.pl \
+  __PROGRAM__ \
       --session /home/user/.session \
       --data-dir /srv/torrents
 
   # Mixed or moved storage: use HASH|PATH mappings.
-  rtorrent_fast_resume_split.pl \
+  __PROGRAM__ \
       --session /home/user/.session \
       mappings.txt
 
@@ -894,4 +1061,7 @@ IMPORTANT:
   existence and exact sizes, but it does NOT hash payload data. Use it only
   when you already trust the data and need to reconstruct lost resume state.
 USAGE
+
+    $text =~ s/__PROGRAM__/$program/g;
+    return $text;
 }
