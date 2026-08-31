@@ -4,9 +4,9 @@ This is a modern version of the old fast resume script that supports the split s
 ---
 ## Usage
 
-    rtorrent_fast_resume_split.pl --session DIR [options]
-    rtorrent_fast_resume_split.pl --session DIR --data-dir DIR [options]
-    rtorrent_fast_resume_split.pl --session DIR [options] MAPPING_FILE
+    rtorrent_fast_resume.pl --session DIR [options]
+    rtorrent_fast_resume.pl --session DIR --data-dir DIR [options]
+    rtorrent_fast_resume.pl --session DIR [options] MAPPING_FILE
 
 ## Required Arguments
 
@@ -72,21 +72,21 @@ This is a modern version of the old fast resume script that supports the split s
 ## Examples
 
     # Normal case: use the paths already saved in the session.
-    rtorrent_fast_resume_split.pl \
+    rtorrent_fast_resume.pl \
         --session /home/user/.session
 
     # Validate session-derived paths without changing anything.
-    rtorrent_fast_resume_split.pl \
+    rtorrent_fast_resume.pl \
         --session /home/user/.session \
         --dry-run
 
     # All torrents have been moved beneath one common directory.
-    rtorrent_fast_resume_split.pl \
+    rtorrent_fast_resume.pl \
         --session /home/user/.session \
         --data-dir /srv/torrents
 
     # Mixed or moved storage: use HASH|PATH mappings.
-    rtorrent_fast_resume_split.pl \
+    rtorrent_fast_resume.pl \
         --session /home/user/.session \
         mappings.txt
 
