@@ -233,9 +233,19 @@ else {
     opendir my $dh, $session
         or die "ERROR: cannot open session directory '$session': $!\n";
 
-    my @hashes = sort map { uc $1 }
-                 grep { /^([0-9A-Fa-f]{40})\.torrent$/ && -f File::Spec->catfile($session, $_) }
-                 readdir $dh;
+    my @hashes;
+
+    while (defined(my $entry = readdir $dh)) {
+        next unless $entry =~ /^([0-9A-Fa-f]{40})\.torrent$/;
+
+        my $hash = uc($1);
+        my $torrent_file = File::Spec->catfile($session, $entry);
+
+        next unless -f $torrent_file;
+        push @hashes, $hash;
+    }
+
+    @hashes = sort @hashes;
 
     closedir $dh;
 
@@ -591,19 +601,11 @@ sub resolve_torrent_layout {
     }
 
     if (@valid > 1) {
-        # If both interpretations resolve to exactly the same payload paths,
-        # there is no ambiguity in practice.
-        my $same = 1;
-        for my $i (0 .. $#{$valid[0][1]}) {
-            if ($valid[0][1][$i] ne $valid[1][1][$i]) {
-                $same = 0;
-                last;
-            }
-        }
-
-        return ($valid[0][0], @{$valid[0][1]}) if $same;
-
-        die "path is valid as both directory and directory_base; specify the mode explicitly";
+        # Auto mode deliberately tests directory-base first. If both layouts
+        # happen to exist, prefer directory-base rather than refusing to
+        # continue. This treats the supplied/session path itself as the
+        # torrent root and avoids unnecessarily appending the torrent name.
+        return ($valid[0][0], @{$valid[0][1]});
     }
 
     die "cannot resolve payload path (" . join('; ', @errors) . ")";
